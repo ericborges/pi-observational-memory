@@ -707,6 +707,7 @@ async function runDropperStage(
 			env: worker.env,
 			reflections: dropperMemory.reflections,
 			observations: dropperMemory.observations,
+			activeObservations: folded.activeObservations,
 			targetTokens: runtime.config.observationsPoolTargetTokens,
 			maxTurns: runtime.config.agentMaxTurns,
 			maxOutputTokens: runtime.config.agentMaxTokens,
