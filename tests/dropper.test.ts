@@ -21,13 +21,15 @@ function fakeAgentLoop(handler: (prompts: any[], context: any, config: any) => P
 }
 
 describe("runDropper maxTokens clamping", () => {
+	const observations = [
+		observation("aaaaaaaaaaaa", { relevance: "medium" }),
+		observation("bbbbbbbbbbbb", { relevance: "low" }),
+	];
 	const args = {
 		apiKey: "test",
 		reflections: [reflection("eeeeeeeeeeee", ["aaaaaaaaaaaa"])],
-		observations: [
-			observation("aaaaaaaaaaaa", { relevance: "medium" }),
-			observation("bbbbbbbbbbbb", { relevance: "low" }),
-		],
+		observations: observations,
+		activeObservations: observations,
 		targetTokens: 20,
 	};
 
@@ -95,6 +97,7 @@ describe("V3 dropper agent", () => {
 		apiKey: "test",
 		reflections: [reflection("eeeeeeeeeeee", ["aaaaaaaaaaaa"])],
 		observations: [obsA, obsB, critical],
+		activeObservations: [obsA, obsB, critical],
 		targetTokens: 20,
 	};
 
@@ -306,13 +309,38 @@ describe("V3 dropper agent", () => {
 			called = true;
 		});
 
+		const observations = [observation("aaaaaaaaaaaa", { relevance: "low" })];
 		await expect(runDropper({
 			...baseArgs,
-			// The rendered line for this observation is 18 tokens; an 18-token target is exactly at target.
-			observations: [observation("aaaaaaaaaaaa", { relevance: "low" })],
+			observations: observations,
+			activeObservations: observations,
 			targetTokens: 18,
 			agentLoop: loop,
 		})).resolves.toBeUndefined();
 		expect(called).toBe(false);
+	});
+
+	it("gates on the full pool when the prompt slice is trimmed below target", async () => {
+		const activeObservations = [
+			"aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc", "dddddddddddd",
+			"eeeeeeeeeeee", "ffffffffffff", "111111111111", "222222222222",
+			"333333333333", "444444444444",
+		].map((id) => observation(id, { relevance: "low" }));
+		const slice = activeObservations.slice(0, 3);
+
+		let userText = "";
+		const loop = fakeAgentLoop((prompts, context) => {
+			userText = prompts[0].content[0].text;
+			return context.tools[0].execute("tool-1", { ids: ["aaaaaaaaaaaa"] });
+		});
+
+		await expect(runDropper({
+			...baseArgs,
+			observations: slice,
+			activeObservations: activeObservations,
+			targetTokens: 100,
+			agentLoop: loop,
+		})).resolves.toEqual(["aaaaaaaaaaaa"]);
+		expect(userText).toContain("Active observation pool: ~180 tokens (the list above shows the oldest 3 of the pool's 10 observations)");
 	});
 });
