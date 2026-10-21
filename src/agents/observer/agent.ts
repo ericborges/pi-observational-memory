@@ -3,6 +3,7 @@ import type { Message, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { Type } from "@earendil-works/pi-ai";
 import type { Static } from "typebox";
 import { hashId } from "../../ids.js";
+import { debugLog } from "../../debug-log.js";
 import { logAgentStreamError } from "../stream-errors.js";
 import { resolveWorkerStreamSimple, type StreamableModelRegistry, type WorkerStreamSimple } from "../worker-stream.js";
 import { AGENT_LOOP_MAX_TOKENS, boundedMaxTokens } from "../../model-budget.js";
@@ -84,6 +85,76 @@ export class ObserverStreamError extends Error {
 
 function joinOrEmpty(items: string[]): string {
 	return items.length ? items.join("\n") : "(none yet)";
+}
+
+/**
+ * Below this length a text-only final reply is treated as a deliberate
+ * "nothing to record" confirmation, not a failed payload; at or above it,
+ * an unparseable reply is logged so a new text-mode shape is diagnosable.
+ */
+const TEXT_MODE_UNPARSED_MIN_CHARS = 200;
+
+function extractAssistantText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (Array.isArray(content)) {
+		let text = "";
+		for (const block of content) {
+			if (block && typeof block === "object" && typeof (block as { text?: unknown }).text === "string") {
+				text += (block as { text: string }).text;
+			}
+		}
+		return text;
+	}
+	return "";
+}
+
+/**
+ * Recovers a schema-valid record_observations payload that the model emitted
+ * as plain text instead of a tool call (a sampling writer model occasionally
+ * "writes" the answer in the content channel). Accepts a wrapped
+ * `{"observations": [...]}` object, a bare array of observation objects, or a
+ * single bare observation object. Per-item validation mirrors the tool
+ * schema; items that fail it are dropped here (the tool path rejects them
+ * the same way). Returns undefined when nothing usable is present.
+ */
+export function parseTextModePayload(text: string): RecordObservationsArgs | undefined {
+	const trimmed = text.trim();
+	if (!trimmed) return undefined;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(trimmed);
+	} catch {
+		return undefined;
+	}
+	let rawItems: unknown;
+	if (Array.isArray(parsed)) {
+		rawItems = parsed;
+	} else if (parsed && typeof parsed === "object") {
+		const obj = parsed as Record<string, unknown>;
+		rawItems = Array.isArray(obj.observations) ? obj.observations : [obj];
+	} else {
+		return undefined;
+	}
+	const timestampPattern = new RegExp(OBSERVATION_TIMESTAMP_PATTERN);
+	const relevanceValues = new Set(["low", "medium", "high", "critical"]);
+	const observations: RecordObservationsArgs["observations"] = [];
+	for (const item of rawItems as unknown[]) {
+		if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+		const o = item as Record<string, unknown>;
+		if (typeof o.timestamp !== "string" || !timestampPattern.test(o.timestamp)) continue;
+		if (typeof o.content !== "string" || o.content.length === 0) continue;
+		if (typeof o.relevance !== "string" || !relevanceValues.has(o.relevance)) continue;
+		if (!Array.isArray(o.sourceEntryIds) || o.sourceEntryIds.length === 0) continue;
+		if (!o.sourceEntryIds.every((id) => typeof id === "string")) continue;
+		observations.push({
+			timestamp: o.timestamp,
+			content: o.content,
+			relevance: o.relevance as RecordObservationsArgs["observations"][number]["relevance"],
+			sourceEntryIds: o.sourceEntryIds as string[],
+		});
+	}
+	if (observations.length === 0) return undefined;
+	return { observations };
 }
 
 export function normalizeSourceEntryIds(
@@ -222,20 +293,47 @@ ${conversation}`;
 		resolveWorkerStreamSimple(model, args.modelRegistry, args.streamSimple),
 	);
 	let streamError: { stopReason: string; errorMessage?: string } | undefined;
+	let lastAssistantText = "";
 	for await (const event of stream) {
 		// Drain events; the tool's execute already collects records.
 		logAgentStreamError("observer", event);
 		// Watch for a terminal API/stream failure so it is not conflated with
-		// a deliberate empty result.
-		const message = (event as { message?: { role?: string; stopReason?: string; errorMessage?: string } }).message;
-		if (message?.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted")) {
-			streamError = { stopReason: message.stopReason, errorMessage: message.errorMessage };
+		// a deliberate empty result, and keep the last assistant text so a
+		// schema-valid payload written to the text channel can be recovered.
+		const message = (event as { message?: { role?: string; stopReason?: string; errorMessage?: string; content?: unknown } }).message;
+		if (message?.role === "assistant") {
+			lastAssistantText = extractAssistantText(message.content);
+			if (message.stopReason === "error" || message.stopReason === "aborted") {
+				streamError = { stopReason: message.stopReason, errorMessage: message.errorMessage };
+			}
 		}
 	}
 	await stream.result();
 
 	if (accumulated.size === 0) {
 		if (streamError) throw new ObserverStreamError(streamError.stopReason, streamError.errorMessage);
+		// Text-mode recovery: a sampling writer model may emit a schema-valid
+		// record_observations payload as plain text instead of a tool call.
+		// Route it through the tool's own execute so it gets identical
+		// validation (allowed source ids, truncation, hash dedupe).
+		const textMode = parseTextModePayload(lastAssistantText);
+		if (textMode) {
+			await recordObservations.execute("text-mode-recovery", textMode);
+			if (accumulated.size > 0) {
+				debugLog("observer.text_mode_recovered", {
+					textLength: lastAssistantText.trim().length,
+					recovered: accumulated.size,
+				});
+				return Array.from(accumulated.values());
+			}
+		} else if (lastAssistantText.trim().length >= TEXT_MODE_UNPARSED_MIN_CHARS) {
+			// Substantive text that is not a recoverable payload: log a head
+			// snippet so a new text-mode shape is diagnosable, not invisible.
+			debugLog("observer.text_mode_unparsed", {
+				textLength: lastAssistantText.trim().length,
+				head: lastAssistantText.trim().slice(0, 200),
+			});
+		}
 		return undefined;
 	}
 	return Array.from(accumulated.values());

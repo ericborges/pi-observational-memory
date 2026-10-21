@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { normalizeSourceEntryIds, OBSERVATION_TIMESTAMP_PATTERN, ObserverStreamError, runObserver } from "../src/agents/observer/agent.js";
+import { normalizeSourceEntryIds, OBSERVATION_TIMESTAMP_PATTERN, ObserverStreamError, parseTextModePayload, runObserver } from "../src/agents/observer/agent.js";
 import { AGENT_LOOP_MAX_TOKENS } from "../src/model-budget.js";
 
 function fakeAgentLoop(handler: (prompts: any[], context: any, config: any) => Promise<void> | void, events: any[] = []): any {
@@ -222,6 +222,133 @@ describe("runObserver", () => {
 		await runObserver({ ...baseArgs, model: { reasoning: true } as any, agentLoop: loop, thinkingLevel: "off" });
 
 		expect(seenReasoning).toBeUndefined();
+	});
+});
+
+describe("parseTextModePayload", () => {
+	const validItem = { timestamp: "2026-05-02 10:30", content: "A fact.", relevance: "medium", sourceEntryIds: ["entry-a"] };
+
+	it("parses wrapped, bare-array, and bare-single-object shapes", () => {
+		expect(parseTextModePayload(JSON.stringify({ observations: [validItem] }))).toEqual({ observations: [validItem] });
+		expect(parseTextModePayload(JSON.stringify([validItem]))).toEqual({ observations: [validItem] });
+		expect(parseTextModePayload(JSON.stringify(validItem))).toEqual({ observations: [validItem] });
+	});
+
+	it("tolerates surrounding whitespace", () => {
+		expect(parseTextModePayload(`  ${JSON.stringify([validItem])}\n`)).toEqual({ observations: [validItem] });
+	});
+
+	it("drops shape-invalid items, keeps shape-valid ones (pool check happens in execute)", () => {
+		const payload = [
+			validItem,
+			{ ...validItem, content: "Bad relevance", relevance: "urgent" },
+			{ ...validItem, content: "Bad timestamp", timestamp: "2026-05-02T10:30" },
+			{ ...validItem, content: "No content", content: "" },
+			{ ...validItem, content: "Bad source type", sourceEntryIds: "entry-a" },
+			"not-an-object",
+			{ ...validItem, content: "Invented id", sourceEntryIds: ["not-in-the-chunk"] },
+		];
+		const parsed = parseTextModePayload(JSON.stringify(payload));
+		expect(parsed).toEqual({ observations: [validItem, payload[6]] });
+	});
+
+	it("returns undefined for empty, non-JSON, and all-invalid input", () => {
+		expect(parseTextModePayload("")).toBeUndefined();
+		expect(parseTextModePayload("   ")).toBeUndefined();
+		expect(parseTextModePayload("Nothing new to record.")) .toBeUndefined();
+		expect(parseTextModePayload("{ not json")).toBeUndefined();
+		expect(parseTextModePayload(JSON.stringify({ observations: ["nope"] }))).toBeUndefined();
+		expect(parseTextModePayload(JSON.stringify(42))).toBeUndefined();
+	});
+});
+
+describe("runObserver text-mode recovery", () => {
+	const baseArgs = {
+		model: {} as any,
+		apiKey: "test",
+		priorReflections: [],
+		priorObservations: [],
+		chunk: "[Source entry id: entry-a]\nUser asked for a memory update.",
+		allowedSourceEntryIds: ["entry-a"],
+	};
+
+	function textLoop(text: string): any {
+		return fakeAgentLoop(() => {}, [{ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text }] } }]);
+	}
+
+	it("recovers a wrapped payload written as plain text, with tool-path-identical records", async () => {
+		const content = "User asked for a memory update.";
+		const loop = textLoop(JSON.stringify({ observations: [{ timestamp: "2026-05-02 10:30", content, relevance: "high", sourceEntryIds: ["entry-a"] }] }));
+
+		const observations = await runObserver({ ...baseArgs, agentLoop: loop });
+
+		expect(observations).toHaveLength(1);
+		expect(observations?.[0]).toMatchObject({ content, timestamp: "2026-05-02 10:30", relevance: "high", sourceEntryIds: ["entry-a"] });
+		expect(observations?.[0].tokenCount).toBe(18);
+		expect(observations?.[0].id).toMatch(/^[a-f0-9]{12}$/);
+	});
+
+	it("recovers a bare-array payload", async () => {
+		const loop = textLoop(JSON.stringify([{ timestamp: "2026-05-02 10:30", content: "Bare array fact.", relevance: "medium", sourceEntryIds: ["entry-a"] }]));
+
+		const observations = await runObserver({ ...baseArgs, agentLoop: loop });
+
+		expect(observations).toHaveLength(1);
+		expect(observations?.[0].content).toBe("Bare array fact.");
+	});
+
+	it("rejects a text payload whose source ids are not in the allowed pool", async () => {
+		const loop = textLoop(JSON.stringify({ observations: [{ timestamp: "2026-05-02 10:30", content: "Bad source", relevance: "medium", sourceEntryIds: ["missing"] }] }));
+		await expect(runObserver({ ...baseArgs, agentLoop: loop })).resolves.toBeUndefined();
+	});
+
+	it("treats a short plain-text confirmation as a deliberate empty", async () => {
+		const loop = textLoop("Nothing new to record in this chunk.");
+		await expect(runObserver({ ...baseArgs, agentLoop: loop })).resolves.toBeUndefined();
+	});
+
+	it("returns undefined for long non-JSON text", async () => {
+		const loop = textLoop("This is a long paragraph of prose about the conversation that is not a payload. ".repeat(5));
+		await expect(runObserver({ ...baseArgs, agentLoop: loop })).resolves.toBeUndefined();
+	});
+
+	it("keeps tool-call records and does not double-count a later text payload", async () => {
+		const loop = fakeAgentLoop(
+			async (_prompts, context) => {
+				await context.tools[0].execute("tool-1", {
+					observations: [{ timestamp: "2026-05-02 10:30", content: "From tool", relevance: "high", sourceEntryIds: ["entry-a"] }],
+				});
+			},
+			[{ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: JSON.stringify({ observations: [{ timestamp: "2026-05-02 10:31", content: "From text", relevance: "high", sourceEntryIds: ["entry-a"] }] }) }] } }],
+		);
+
+		const observations = await runObserver({ ...baseArgs, agentLoop: loop });
+
+		expect(observations).toHaveLength(1);
+		expect(observations?.[0].content).toBe("From tool");
+	});
+
+	it("still throws ObserverStreamError on stream failure even when text is present", async () => {
+		const loop = fakeAgentLoop(() => {}, [
+			{ type: "message_end", message: { role: "assistant", stopReason: "error", errorMessage: "boom", content: [{ type: "text", text: JSON.stringify({ observations: [{ timestamp: "2026-05-02 10:30", content: "Lost", relevance: "high", sourceEntryIds: ["entry-a"] }] }) }] } },
+		]);
+
+		const error = await runObserver({ ...baseArgs, agentLoop: loop }).catch((e) => e);
+		expect(error).toBeInstanceOf(ObserverStreamError);
+	});
+
+	it("recovers from a string-typed content message", async () => {
+		const loop = fakeAgentLoop(() => {}, [
+			{ type: "message_end", message: { role: "assistant", stopReason: "stop", content: JSON.stringify(["nope"]) } },
+		]);
+		await expect(runObserver({ ...baseArgs, agentLoop: loop })).resolves.toBeUndefined();
+
+		const loop2 = fakeAgentLoop(() => {}, [
+			{ type: "message_end", message: { role: "assistant", stopReason: "stop", content: JSON.stringify({ observations: [{ timestamp: "2026-05-02 10:30", content: "String content fact.", relevance: "low", sourceEntryIds: ["entry-a"] }] }) } },
+		]);
+		const observations = await runObserver({ ...baseArgs, agentLoop: loop2 });
+		expect(observations).toHaveLength(1);
+		expect(observations?.[0].content).toBe("String content fact.");
 	});
 });
 
