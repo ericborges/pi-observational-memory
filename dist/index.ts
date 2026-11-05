@@ -2293,14 +2293,15 @@ function selectDropCandidates(ids, observations, maxDrops, reflections = []) {
   }).slice(0, maxDrops).map((candidate) => candidate.id);
 }
 async function runDropper(args) {
-  const { model, apiKey, headers, env, reflections, observations, targetTokens, signal } = args;
+  const { model, apiKey, headers, env, reflections, observations, activeObservations, targetTokens, signal } = args;
   if (observations.length === 0) return void 0;
-  const metrics = observationPoolMetrics(observations, targetTokens);
+  const metrics = observationPoolMetrics(activeObservations, targetTokens);
   const { observationTokens, fullness, tokensOverTarget, maxDropsAllowed } = metrics;
   const coverageById = reflectionCoverageMap(observations, reflections);
   const coverageSummaryByRelevance = summarizeCoverageByRelevance(observations, coverageById);
   debugLog("dropper.agent_start", {
-    activeObservationCount: observations.length,
+    activeObservationCount: activeObservations.length,
+    listedObservationCount: observations.length,
     reflectionCount: reflections.length,
     observationTokens,
     targetTokens,
@@ -2390,13 +2391,15 @@ async function runDropper(args) {
     }
   };
   const fullnessPercent = Math.round(fullness * 100);
+  const omittedObservations = activeObservations.length - observations.length;
+  const listedNote = omittedObservations > 0 ? ` (the list above shows the oldest ${observations.length.toLocaleString()} of the pool's ${activeObservations.length.toLocaleString()} observations)` : "";
   const userText = `CURRENT REFLECTIONS:
 ${joinOrEmpty2(reflections.map(reflectionToSummaryLine))}
 
 CURRENT OBSERVATIONS:
 ${joinOrEmpty2(observations.map((observation) => observationToDropperLine(observation, coverageTierForObservation(observation, coverageById))))}
 
-Active observation pool: ~${observationTokens.toLocaleString()} tokens; target: ~${targetTokens.toLocaleString()} tokens; fullness against target: ~${fullnessPercent.toLocaleString()}%; over target by ~${tokensOverTarget.toLocaleString()} tokens.
+Active observation pool: ~${observationTokens.toLocaleString()} tokens${listedNote}; target: ~${targetTokens.toLocaleString()} tokens; fullness against target: ~${fullnessPercent.toLocaleString()}%; over target by ~${tokensOverTarget.toLocaleString()} tokens.
 Maximum drops allowed this run: ${maxDropsAllowed.toLocaleString()} observation${maxDropsAllowed === 1 ? "" : "s"}. This maximum is sized to move the active pool toward the target if every proposed drop is clearly safe.
 This maximum is a hard upper bound, not a target. Drop fewer or none if fewer observations are clearly safe.`;
   const prompts = [{ role: "user", content: [{ type: "text", text: userText }], timestamp: Date.now() }];
@@ -3218,6 +3221,7 @@ async function runDropperStage(pi, runtime, ctx, resolver, sameRunReflections, s
       env: worker.env,
       reflections: dropperMemory.reflections,
       observations: dropperMemory.observations,
+      activeObservations: folded.activeObservations,
       targetTokens: runtime.config.observationsPoolTargetTokens,
       maxTurns: runtime.config.agentMaxTurns,
       maxOutputTokens: runtime.config.agentMaxTokens,
